@@ -2,8 +2,13 @@ import "server-only";
 import { promises as fs } from "fs";
 import path from "path";
 import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
+import { get, put, BlobPreconditionFailedError } from "@vercel/blob";
 
 const DATA_FILE = path.join(process.cwd(), "data", "posts.json");
+const BLOB_PATH = "board/posts.json";
+
+// Vercel Blob 토큰이 있으면(=배포 환경) Blob에, 없으면(=내 컴퓨터) 파일에 저장
+const useBlob = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 
 type StoredPost = {
   id: number;
@@ -34,28 +39,70 @@ function toPublic(p: StoredPost): Post {
   };
 }
 
-async function readAll(): Promise<StoredPost[]> {
+// ---------- 저장소 (파일 / Blob) ----------
+
+type Snapshot = { posts: StoredPost[]; etag: string | null };
+
+function parsePosts(raw: string): StoredPost[] {
+  const parsed = JSON.parse(raw);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+async function load(): Promise<Snapshot> {
+  if (useBlob) {
+    const res = await get(BLOB_PATH, { access: "private", useCache: false });
+    if (!res || res.statusCode !== 200) return { posts: [], etag: null };
+    const raw = await new Response(res.stream).text();
+    return { posts: parsePosts(raw), etag: res.blob.etag };
+  }
   try {
     const raw = await fs.readFile(DATA_FILE, "utf-8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return { posts: parsePosts(raw), etag: null };
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if ((e as NodeJS.ErrnoException).code === "ENOENT")
+      return { posts: [], etag: null };
     throw e;
   }
 }
 
-async function writeAll(posts: StoredPost[]) {
+async function save(posts: StoredPost[], etag: string | null) {
+  const body = JSON.stringify(posts, null, 2);
+  if (useBlob) {
+    // etag가 있으면 "내가 읽은 뒤 아무도 안 바꿨을 때만" 저장 (동시 작성 보호)
+    await put(BLOB_PATH, body, {
+      access: "private",
+      contentType: "application/json",
+      addRandomSuffix: false,
+      ...(etag ? { ifMatch: etag } : { allowOverwrite: false }),
+    });
+    return;
+  }
   await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
   const tmp = DATA_FILE + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(posts, null, 2), "utf-8");
+  await fs.writeFile(tmp, body, "utf-8");
   await fs.rename(tmp, DATA_FILE);
 }
 
-// 동시에 여러 요청이 파일을 고치다 내용이 섞이지 않도록 순서대로 처리
+// 같은 서버 안에서는 순서대로, 다른 서버와 겹치면 다시 읽어서 재시도
 let queue: Promise<unknown> = Promise.resolve();
-function serialize<T>(fn: () => Promise<T>): Promise<T> {
-  const run = queue.then(fn, fn);
+function mutate<T>(
+  fn: (posts: StoredPost[]) => { posts: StoredPost[] | null; result: T },
+): Promise<T> {
+  const run = queue.then(async () => {
+    for (let attempt = 0; ; attempt++) {
+      const { posts, etag } = await load();
+      const out = fn(posts);
+      if (!out.posts) return out.result; // 변경 없음
+      try {
+        await save(out.posts, etag);
+        return out.result;
+      } catch (e) {
+        const conflict =
+          e instanceof BlobPreconditionFailedError || (useBlob && !etag);
+        if (!useBlob || !conflict || attempt >= 4) throw e;
+      }
+    }
+  });
   queue = run.catch(() => undefined);
   return run;
 }
@@ -66,13 +113,15 @@ function checkPassword(post: StoredPost, password: string) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// ---------- 게시물 기능 ----------
+
 export async function listPosts(): Promise<Post[]> {
-  const posts = await readAll();
+  const { posts } = await load();
   return posts.map(toPublic).sort((a, b) => b.id - a.id);
 }
 
 export async function getPost(id: number): Promise<Post | null> {
-  const posts = await readAll();
+  const { posts } = await load();
   const found = posts.find((p) => p.id === id);
   return found ? toPublic(found) : null;
 }
@@ -83,8 +132,7 @@ export function createPost(input: {
   title: string;
   content: string;
 }): Promise<Post> {
-  return serialize(async () => {
-    const posts = await readAll();
+  return mutate((posts) => {
     const salt = randomBytes(16).toString("hex");
     const post: StoredPost = {
       id: posts.reduce((m, p) => Math.max(m, p.id), 0) + 1,
@@ -96,9 +144,7 @@ export function createPost(input: {
       salt,
       passwordHash: hashPassword(input.password, salt),
     };
-    posts.push(post);
-    await writeAll(posts);
-    return toPublic(post);
+    return { posts: [...posts, post], result: toPublic(post) };
   });
 }
 
@@ -109,17 +155,20 @@ export function updatePost(
   password: string,
   input: { author: string; title: string; content: string },
 ): Promise<MutationResult> {
-  return serialize(async () => {
-    const posts = await readAll();
+  return mutate<MutationResult>((posts) => {
     const post = posts.find((p) => p.id === id);
-    if (!post) return "not_found";
-    if (!checkPassword(post, password)) return "wrong_password";
-    post.author = input.author;
-    post.title = input.title;
-    post.content = input.content;
-    post.updatedAt = new Date().toISOString();
-    await writeAll(posts);
-    return "ok";
+    if (!post) return { posts: null, result: "not_found" };
+    if (!checkPassword(post, password))
+      return { posts: null, result: "wrong_password" };
+    const updated: StoredPost = {
+      ...post,
+      ...input,
+      updatedAt: new Date().toISOString(),
+    };
+    return {
+      posts: posts.map((p) => (p.id === id ? updated : p)),
+      result: "ok",
+    };
   });
 }
 
@@ -127,12 +176,11 @@ export function deletePost(
   id: number,
   password: string,
 ): Promise<MutationResult> {
-  return serialize(async () => {
-    const posts = await readAll();
+  return mutate<MutationResult>((posts) => {
     const post = posts.find((p) => p.id === id);
-    if (!post) return "not_found";
-    if (!checkPassword(post, password)) return "wrong_password";
-    await writeAll(posts.filter((p) => p.id !== id));
-    return "ok";
+    if (!post) return { posts: null, result: "not_found" };
+    if (!checkPassword(post, password))
+      return { posts: null, result: "wrong_password" };
+    return { posts: posts.filter((p) => p.id !== id), result: "ok" };
   });
 }
